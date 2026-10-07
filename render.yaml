@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: nse-stock-futures-dashboard
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python server.py"
+    healthCheckPath: "/data"
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.15"
