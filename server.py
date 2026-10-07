@@ -215,5 +215,4 @@ if __name__=='__main__':
     server=ThreadingHTTPServer((HOST,PORT),Handler)
     print(f'Listening on {HOST}:{PORT}')
     # Render provides the public HTTPS URL; do not attempt to open a browser on the server.
-    except: pass
     server.serve_forever()
