@@ -6,8 +6,11 @@ from zoneinfo import ZoneInfo
 
 HOST='0.0.0.0'; PORT=int(os.environ.get('PORT','10000')); REFRESH=15; INSTR_REFRESH=3600
 CID=os.environ.get('DHAN_CLIENT_ID','').strip(); TOKEN=os.environ.get('DHAN_ACCESS_TOKEN','').strip()
-MASTER='https://images.dhan.co/api-data/api-scrip-master.csv'; LTP='https://api.dhan.co/v2/marketfeed/ltp'; IST=ZoneInfo('Asia/Kolkata')
-state={'rows':[],'updated':'','error':'Starting…','busy':False,'symbols':0,'ok':0,'fail':0}; lock=threading.Lock()
+MASTER='https://images.dhan.co/api-data/api-scrip-master-detailed.csv'
+LTP='https://api.dhan.co/v2/marketfeed/ltp'
+IST=ZoneInfo('Asia/Kolkata')
+
+state={'rows':[],'updated':'','error':'Starting…','busy':False,'symbols':0,'ok':0,'fail':0,'master_total':0,'nse_futstk':0,'spot_count':0}; lock=threading.Lock()
 inst=[]; inst_at=0; ilock=threading.Lock()
 
 def now(): return datetime.now(IST)
@@ -15,52 +18,68 @@ def num(v):
     try:return float(str(v).replace(',','').strip()) if v not in (None,'') else None
     except:return None
 def exp(v):
-    try:return datetime.strptime(str(v)[:10],'%Y-%m-%d').date()
+    if not v:return None
+    s=str(v).strip()
+    for fmt,part in (('%Y-%m-%d',10),('%Y-%m-%d %H:%M:%S',19),('%d-%b-%Y',11),('%d/%m/%Y',10),('%d-%m-%Y',10)):
+        try:return datetime.strptime(s[:part],fmt).date()
+        except:pass
+    try:return datetime.fromisoformat(s.replace('Z','+00:00')).date()
     except:return None
 
 def get(url,timeout=60):
-    r=Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'*/*'}); 
+    r=Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/csv,text/plain,*/*'})
     with urlopen(r,timeout=timeout) as x:return x.read()
 
 def dhan(payload):
-    if not CID or not TOKEN: raise RuntimeError('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
+    if not CID or not TOKEN:raise RuntimeError('Missing DHAN_CLIENT_ID or DHAN_ACCESS_TOKEN')
     r=Request(LTP,data=json.dumps(payload).encode(),headers={'Accept':'application/json','Content-Type':'application/json','access-token':TOKEN,'client-id':CID},method='POST')
     try:
-        with urlopen(r,timeout=20) as x: raw=x.read(); status=getattr(x,'status',200)
-    except Exception as e: raise RuntimeError(f'Dhan LTP request failed: {e}')
-    if status!=200: raise RuntimeError(f'Dhan LTP HTTP {status}')
+        with urlopen(r,timeout=20) as x:raw=x.read();status=getattr(x,'status',200)
+    except Exception as e:raise RuntimeError(f'Dhan LTP request failed: {e}')
+    if status!=200:raise RuntimeError(f'Dhan LTP HTTP {status}')
     try:o=json.loads(raw.decode())
     except:raise RuntimeError('Dhan returned invalid JSON')
-    if str(o.get('status','')).lower() not in ('success','true',''): raise RuntimeError(f"Dhan API error: {o.get('message') or o.get('remarks') or o}")
+    if str(o.get('status','')).lower() not in ('success','true',''):raise RuntimeError(f"Dhan API error: {o.get('message') or o.get('remarks') or o}")
     return o.get('data',{})
 
 def load_inst(force=False):
     global inst,inst_at
     with ilock:
         if inst and not force and time.time()-inst_at<INSTR_REFRESH:return inst
-        text=get(MASTER).decode('utf-8-sig','replace'); rd=csv.DictReader(io.StringIO(text)); today=now().date(); out=[]
-        need={'SEM_EXM_EXCH_ID','SEM_SEGMENT','SEM_SMST_SECURITY_ID','SEM_INSTRUMENT_NAME','SEM_EXPIRY_DATE','SM_SYMBOL_NAME'}
-        if not rd.fieldnames or not need.issubset(set(rd.fieldnames)):raise RuntimeError('Dhan instrument master format changed')
+        raw=get(MASTER);text=raw.decode('utf-8-sig','replace');rd=csv.DictReader(io.StringIO(text))
+        if not rd.fieldnames:raise RuntimeError('Dhan instrument master has no CSV headers')
+        required={'EXCH_ID','SEGMENT','SECURITY_ID','INSTRUMENT','SYMBOL_NAME','SM_EXPIRY_DATE'}
+        missing=required-set(rd.fieldnames)
+        if missing:raise RuntimeError('Dhan detailed master missing columns: '+','.join(sorted(missing)))
+        out=[];total=0;nse_futstk=0;spot_count=0;today=now().date()
         for r in rd:
-            if r.get('SEM_EXM_EXCH_ID','').strip()!='NSE':continue
-            sym=r.get('SM_SYMBOL_NAME','').strip().upper(); sid=r.get('SEM_SMST_SECURITY_ID','').strip(); typ=r.get('SEM_INSTRUMENT_NAME','').strip().upper()
-            if not sym or not sid:continue
-            if typ=='EQUITY':out.append(('spot',sym,sid,None))
-            elif typ=='FUTSTK':
-                d=exp(r.get('SEM_EXPIRY_DATE'))
-                if d and d>=today:out.append(('future',sym,sid,d))
-        inst=out; inst_at=time.time(); return inst
+            total+=1;exch=str(r.get('EXCH_ID','')).strip().upper();seg=str(r.get('SEGMENT','')).strip().upper();typ=str(r.get('INSTRUMENT','')).strip().upper()
+            if exch!='NSE':continue
+            sid=str(r.get('SECURITY_ID','')).strip()
+            if not sid:continue
+            if typ=='EQUITY' and seg=='E':
+                sym=str(r.get('SYMBOL_NAME','')).strip().upper()
+                if sym:out.append(('spot',sym,sid,None,None));spot_count+=1
+            elif typ=='FUTSTK' and seg=='D':
+                nse_futstk+=1;sym=str(r.get('UNDERLYING_SYMBOL','')).strip().upper() or str(r.get('SYMBOL_NAME','')).strip().upper();d=exp(r.get('SM_EXPIRY_DATE'));code=str(r.get('SEM_EXPIRY_CODE',r.get('EXPIRY_CODE',''))).strip()
+                if sym and d and d>=today:out.append(('future',sym,sid,d,code))
+        with lock:state.update(master_total=total,nse_futstk=nse_futstk,spot_count=spot_count)
+        if not any(x[0]=='future' for x in out):raise RuntimeError(f'No NSE FUTSTK contracts parsed. Master rows={total}, NSE FUTSTK={nse_futstk}, NSE equity={spot_count}.')
+        inst=out;inst_at=time.time();print(f'Dhan master: total={total}, NSE FUTSTK={nse_futstk}, NSE equity={spot_count}, usable rows={len(out)}',flush=True);return inst
 
 def contracts():
-    spots={}; fut={}
-    for typ,sid_sym,sid,d in load_inst():
-        if typ=='spot':spots.setdefault(sid_sym,sid)
-        else:fut.setdefault(sid_sym,[]).append((d,sid))
+    spots={};fut={}
+    for typ,sym,sid,d,code in load_inst():
+        if typ=='spot':spots.setdefault(sym,sid)
+        else:fut.setdefault(sym,[]).append((d,sid,code))
     out={}
-    for s,a in fut.items():
-        a=sorted(a)
-        if len(a)>=2:out[s]={'spot':spots.get(s),'near':a[0],'next':a[1],'far':a[2] if len(a)>2 else None}
-    return out
+    for sym,arr in fut.items():
+        arr=sorted(arr,key=lambda x:x[0]);unique=[];seen=set()
+        for x in arr:
+            if x[0] in seen:continue
+            seen.add(x[0]);unique.append(x)
+        if len(unique)>=2:out[sym]={'spot':spots.get(sym),'near':unique[0],'next':unique[1],'far':unique[2] if len(unique)>=3 else None}
+    print(f'Contract map: {len(out)} stocks with >=2 NSE stock-future expiries',flush=True);return out
 
 def batches(a,n=1000):
     for i in range(0,len(a),n):yield a[i:i+n]
@@ -96,16 +115,18 @@ def make_rows(cs,q):
 def refresh():
     with lock:
         if state['busy']:return
-        state['busy']=True; state['error']='Refreshing Dhan market data…'
+        state['busy']=True;state['error']='Refreshing Dhan market data…'
     try:
         cs=contracts()
-        if not cs:raise RuntimeError('No NSE stock-futures contracts found in Dhan instrument master')
+        if not cs:raise RuntimeError('No stock futures with at least Near and Next expiry were found.')
+        print(f'Requesting Dhan LTP for {len(cs)} stocks...',flush=True)
         rows=make_rows(cs,quotes(cs))
-        if not rows:raise RuntimeError('Dhan returned no usable stock-futures quotes. Check Dhan Data API access.')
-        with lock:
-            state.update(rows=rows,updated=now().strftime('%d-%b-%Y %H:%M:%S'),symbols=len(cs),ok=len(rows),fail=max(0,len(cs)-len(rows)),error='')
+        if not rows:raise RuntimeError('Dhan returned no usable stock-futures quotes. Check Dhan Data API access/entitlement and market hours.')
+        with lock:state.update(rows=rows,updated=now().strftime('%d-%b-%Y %H:%M:%S'),symbols=len(cs),ok=len(rows),fail=max(0,len(cs)-len(rows)),error='')
+        print(f'Dhan refresh OK: rows={len(rows)}, qualifying={sum(1 for x in rows if x["spot"]>x["near"] and x["spot"]>x["next"] and x["nearNext"]>0)}',flush=True)
     except Exception as e:
         with lock:state['error']=f'{type(e).__name__}: {e}'
+        print('DATA ERROR:',state['error'],flush=True)
     finally:
         with lock:state['busy']=False
 
@@ -125,6 +146,5 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):pass
 
 if __name__=='__main__':
-    print('LIVE NSE STOCK FUTURES DASHBOARD - DHAN V1');print(f'Refresh: {REFRESH}s')
-    refresh();print('DATA ERROR:',state['error']) if state['error'] else print('Loaded',len(state['rows']),'rows')
+    print('LIVE NSE STOCK FUTURES DASHBOARD - DHAN V2',flush=True);print(f'Refresh: {REFRESH}s',flush=True);print('DHAN_CLIENT_ID:', 'FOUND' if CID else 'MISSING',flush=True);print('DHAN_ACCESS_TOKEN:', 'FOUND' if TOKEN else 'MISSING',flush=True);print('Loading Dhan detailed instrument master...',flush=True);refresh();print('DATA ERROR:',state['error'],flush=True) if state['error'] else print('Loaded',len(state['rows']),'rows',flush=True)
     threading.Thread(target=worker,daemon=True).start();server=ThreadingHTTPServer((HOST,PORT),Handler);print('Listening on',PORT);server.serve_forever()
